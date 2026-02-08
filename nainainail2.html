@@ -24,6 +24,38 @@
 <body class="bg-[#F8DEE5]">
     <div id="root"></div>
 
+    <!-- Firebase SDK (模組化引入) -->
+    <script type="module">
+        // 為了讓 Babel 內的 React 程式碼可以使用 Firebase，我們將變數掛載到 window
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot, collection } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // 從環境變數取得設定 (由 Canvas 環境自動提供)
+        const firebaseConfig = JSON.parse(__firebase_config);
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        // 將 Firebase 功能掛載到 window 物件，供 React 組件使用
+        window.db = db;
+        window.auth = auth;
+        window.appId = appId;
+        window.initialAuthToken = initialAuthToken;
+        // 匯出需要的函式
+        window.firebaseFunctions = {
+            signInAnonymously,
+            signInWithCustomToken,
+            onAuthStateChanged,
+            doc,
+            setDoc,
+            onSnapshot,
+            collection
+        };
+    </script>
+
     <script type="text/babel">
         const { useState, useEffect, useMemo } = React;
 
@@ -447,22 +479,25 @@
         };
 
         // --- 後台管理系統 ---
-        const AdminPanel = ({ blockedDates, setBlockedDates, blockedTimes, setBlockedTimes, onLogout }) => {
+        const AdminPanel = ({ blockedDates, setBlockedDates, blockedTimes, setBlockedTimes, onLogout, saveSettings }) => {
             const calendarData = useMemo(() => getCalendarData(), []); // 優化：使用 useMemo
             const WEEKDAYS = ['日', '一', '二', '三', '四', '五', '六'];
             const [selectedDate, setSelectedDate] = useState(null);
             const [viewMonthIndex, setViewMonthIndex] = useState(0);
             const monthData = calendarData[viewMonthIndex];
 
-            const toggleDateBlock = (dateStr) => {
+            const toggleDateBlock = async (dateStr) => {
+                let newDates;
                 if (blockedDates.includes(dateStr)) {
-                    setBlockedDates(blockedDates.filter(d => d !== dateStr));
+                    newDates = blockedDates.filter(d => d !== dateStr);
                 } else {
-                    setBlockedDates([...blockedDates, dateStr]);
+                    newDates = [...blockedDates, dateStr];
                 }
+                setBlockedDates(newDates); // Optimistic update
+                await saveSettings(newDates, blockedTimes);
             };
 
-            const toggleTimeBlock = (time) => {
+            const toggleTimeBlock = async (time) => {
                 if (!selectedDate) return;
                 const dateStr = selectedDate.formatted;
                 const currentBlockedTimes = blockedTimes[dateStr] || [];
@@ -472,7 +507,9 @@
                 } else {
                     newBlockedTimes = [...currentBlockedTimes, time];
                 }
-                setBlockedTimes({ ...blockedTimes, [dateStr]: newBlockedTimes });
+                const updatedTimes = { ...blockedTimes, [dateStr]: newBlockedTimes };
+                setBlockedTimes(updatedTimes); // Optimistic update
+                await saveSettings(blockedDates, updatedTimes);
             };
 
             return (
@@ -548,62 +585,68 @@
             const [isAdminMode, setIsAdminMode] = useState(false);
             const [showLoginModal, setShowLoginModal] = useState(false);
             const [passwordInput, setPasswordInput] = useState('');
+            const [user, setUser] = useState(null);
 
-            // 使用 localStorage 來持久化儲存，並增加錯誤處理
-            const [blockedDates, setBlockedDates] = useState(() => {
-                try {
-                    const saved = localStorage.getItem('nainai_blockedDates');
-                    return saved ? JSON.parse(saved) : [];
-                } catch (e) {
-                    console.error("無法讀取 localStorage", e);
-                    return [];
-                }
-            });
-            const [blockedTimes, setBlockedTimes] = useState(() => {
-                try {
-                    const saved = localStorage.getItem('nainai_blockedTimes');
-                    return saved ? JSON.parse(saved) : {};
-                } catch (e) {
-                    console.error("無法讀取 localStorage", e);
-                    return {};
-                }
-            });
+            const [blockedDates, setBlockedDates] = useState([]);
+            const [blockedTimes, setBlockedTimes] = useState({});
 
-            // 新增：監聽 localStorage 變更 (實現多視窗/分頁同步)
+            const { signInAnonymously, signInWithCustomToken, onAuthStateChanged, doc, setDoc, onSnapshot, collection } = window.firebaseFunctions;
+            const db = window.db;
+            const auth = window.auth;
+            const appId = window.appId;
+            const initialAuthToken = window.initialAuthToken;
+
+            // Auth Effect
             useEffect(() => {
-                const handleStorageChange = () => {
-                    try {
-                        const newDates = JSON.parse(localStorage.getItem('nainai_blockedDates') || '[]');
-                        const newTimes = JSON.parse(localStorage.getItem('nainai_blockedTimes') || '{}');
-                        setBlockedDates(newDates);
-                        setBlockedTimes(newTimes);
-                    } catch (e) { console.error(e); }
+                const initAuth = async () => {
+                    if (initialAuthToken) {
+                        await signInWithCustomToken(auth, initialAuthToken);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
                 };
-
-                window.addEventListener('storage', handleStorageChange);
-                return () => window.removeEventListener('storage', handleStorageChange);
+                initAuth();
+                const unsubscribe = onAuthStateChanged(auth, setUser);
+                return () => unsubscribe();
             }, []);
 
-            // 修正：只有當內容真正改變時才寫入，避免初始化時將空值覆蓋回去
+            // Firestore Data Sync Effect
             useEffect(() => {
-                try {
-                    const current = localStorage.getItem('nainai_blockedDates');
-                    const next = JSON.stringify(blockedDates);
-                    if (current !== next) {
-                        localStorage.setItem('nainai_blockedDates', next);
-                    }
-                } catch (e) {}
-            }, [blockedDates]);
+                if (!user) return;
 
-            useEffect(() => {
-                try {
-                    const current = localStorage.getItem('nainai_blockedTimes');
-                    const next = JSON.stringify(blockedTimes);
-                    if (current !== next) {
-                        localStorage.setItem('nainai_blockedTimes', next);
+                // Path for public settings: /artifacts/{appId}/public/data/nainai_settings/blocked_data
+                const settingsRef = doc(db, 'artifacts', appId, 'public', 'data', 'nainai_settings', 'blocked_data');
+
+                const unsubscribe = onSnapshot(settingsRef, (docSnap) => {
+                    if (docSnap.exists()) {
+                        const data = docSnap.data();
+                        setBlockedDates(data.blockedDates || []);
+                        setBlockedTimes(data.blockedTimes || {});
+                    } else {
+                        // Document doesn't exist yet, initialize state empty
+                        setBlockedDates([]);
+                        setBlockedTimes({});
                     }
-                } catch (e) {}
-            }, [blockedTimes]);
+                }, (error) => {
+                    console.error("Firestore sync error:", error);
+                });
+
+                return () => unsubscribe();
+            }, [user]);
+
+            const saveSettings = async (newDates, newTimes) => {
+                if (!user) return;
+                const settingsRef = doc(db, 'artifacts', appId, 'public', 'data', 'nainai_settings', 'blocked_data');
+                try {
+                    await setDoc(settingsRef, {
+                        blockedDates: newDates,
+                        blockedTimes: newTimes
+                    }, { merge: true });
+                } catch (error) {
+                    console.error("Error saving settings:", error);
+                    alert("儲存設定失敗，請檢查網路連線");
+                }
+            };
 
             const handleLogin = () => {
                 if (passwordInput === '1138') {
@@ -616,7 +659,14 @@
             };
 
             if (isAdminMode) {
-                return <AdminPanel blockedDates={blockedDates} setBlockedDates={setBlockedDates} blockedTimes={blockedTimes} setBlockedTimes={setBlockedTimes} onLogout={() => setIsAdminMode(false)} />;
+                return <AdminPanel 
+                    blockedDates={blockedDates} 
+                    setBlockedDates={setBlockedDates} 
+                    blockedTimes={blockedTimes} 
+                    setBlockedTimes={setBlockedTimes} 
+                    onLogout={() => setIsAdminMode(false)}
+                    saveSettings={saveSettings} 
+                />;
             }
 
             return (
